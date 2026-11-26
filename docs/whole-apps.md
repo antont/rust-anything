@@ -182,7 +182,8 @@ rust-anything app lift .
   `body_file` relative to the inputs file or the repository) and traps: path segments and query
   values swapped for the same traps as CLI arguments, bodies for text and JSON traps, and an
   unknown route. Each run starts the server fresh and sends the requests in name order, so state
-  between requests is kept.
+  between requests is kept, and an input that repeats an earlier request (a read after a write) is
+  a case of its own.
 - A server that keeps state in files gets a fresh copy for every start: `--fresh db.json` (a file
   or folder, repeatable) is snapshotted into `http/files/` and copied into a new working
   directory each time the original, the front door or a build starts; `--arg db.json` is an

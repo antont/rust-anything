@@ -1743,7 +1743,10 @@ pub(crate) fn record(
     let mut counts = [0usize; 3];
     let mut bases = Vec::new();
     let mut push = |kind: usize, given: Option<String>, req: Req| -> bool {
-        if !seen.insert(req_key(&req)) {
+        // Requests run in name order against one server, so state carries from case to case:
+        // an input repeating an earlier request (a read after a write) is a case of its own.
+        // Examples and traps are still deduplicated, and traps skip what inputs already send.
+        if !seen.insert(req_key(&req)) && kind != 1 {
             return false;
         }
         counts[kind] += 1;
@@ -2068,7 +2071,9 @@ fn load_specs(dir: &Path) -> Result<Vec<Spec>> {
         .map(|e| e.path())
         .filter(|p| p.is_file() && p.extension().is_some_and(|e| e == "toml"))
         .collect();
-    paths.sort();
+    // By case name, the order recording sent them in: `add` before `add-again`, which sorted as
+    // file names (`add-again.toml` < `add.toml`) would swap, and a server's state with them.
+    paths.sort_by(|a, b| a.file_stem().cmp(&b.file_stem()));
     let specs = paths
         .iter()
         .map(|p| load_spec(dir, p))

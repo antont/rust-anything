@@ -371,6 +371,118 @@ class H(BaseHTTPRequestHandler):
 HTTPServer(("127.0.0.1", int(os.environ["PORT"])), H).serve_forever()
 "#;
 
+/// A server that counts `POST /add` and answers every request with the count.
+const COUNTER_SERVER: &str = r#"const http = require("node:http");
+let n = 0;
+http.createServer((req, res) => {
+  if (req.method === "POST" && req.url === "/add") n += 1;
+  res.writeHead(200, { "content-type": "text/plain" });
+  res.end(String(n));
+}).listen(Number(process.env.PORT));
+"#;
+
+#[test]
+fn http_record_keeps_a_named_input_that_repeats_an_earlier_request() {
+    // Requests run in name order against one server, so state carries from case to case: the
+    // same request after a write is a different case, and dropping it as a duplicate loses it.
+    if !common::have("node") {
+        return;
+    }
+    let repo =
+        std::env::temp_dir().join(format!("rust-anything-http-repeat-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&repo);
+    std::fs::create_dir_all(&repo).unwrap();
+    std::fs::write(repo.join("server.js"), COUNTER_SERVER).unwrap();
+    std::fs::write(
+        repo.join("inputs.jsonl"),
+        concat!(
+            "{\"name\":\"1-count\",\"path\":\"/count\"}\n",
+            "{\"name\":\"2-add\",\"method\":\"POST\",\"path\":\"/add\"}\n",
+            "{\"name\":\"3-count-again\",\"path\":\"/count\"}\n",
+        ),
+    )
+    .unwrap();
+    let out = app::record(&RecordOptions {
+        repo: &repo,
+        run: &words("node server.js"),
+        inputs: Some(&repo.join("inputs.jsonl")),
+        normalize: &[],
+        name: None,
+        traps: false,
+        timeout_secs: None,
+        http: Some(true),
+        server_args: None,
+        fresh: None,
+        pace_ms: None,
+        port: None,
+        float_tolerance: None,
+        float_files: &[],
+        effects: None,
+        ready_secs: None,
+        ready_request: None,
+    })
+    .unwrap();
+    let again = std::fs::read_to_string(out.dir.join("3-count-again.body")).ok();
+    let first = std::fs::read_to_string(out.dir.join("1-count.body")).ok();
+    let repeated = replay(&repo, None);
+    let _ = std::fs::remove_dir_all(&repo);
+    assert_eq!(out.cases, 3, "{out:?}");
+    assert_eq!(first.as_deref(), Some("0"));
+    assert_eq!(
+        again.as_deref(),
+        Some("1"),
+        "the repeated request is recorded after the write"
+    );
+    assert_eq!(repeated.passed, 3, "{:?}", repeated.failures);
+}
+
+#[test]
+fn http_replay_sends_cases_in_the_order_they_were_recorded() {
+    // Recording sends requests in case-name order. Replay must too: sorted as file names,
+    // `add-again.toml` comes before `add.toml`, and a server with state answers differently.
+    if !common::have("node") {
+        return;
+    }
+    let repo =
+        std::env::temp_dir().join(format!("rust-anything-http-order-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&repo);
+    std::fs::create_dir_all(&repo).unwrap();
+    std::fs::write(repo.join("server.js"), COUNTER_SERVER).unwrap();
+    std::fs::write(
+        repo.join("inputs.jsonl"),
+        concat!(
+            "{\"name\":\"add\",\"method\":\"POST\",\"path\":\"/add\"}\n",
+            "{\"name\":\"add-again\",\"method\":\"POST\",\"path\":\"/add\"}\n",
+        ),
+    )
+    .unwrap();
+    let out = app::record(&RecordOptions {
+        repo: &repo,
+        run: &words("node server.js"),
+        inputs: Some(&repo.join("inputs.jsonl")),
+        normalize: &[],
+        name: None,
+        traps: false,
+        timeout_secs: None,
+        http: Some(true),
+        server_args: None,
+        fresh: None,
+        pace_ms: None,
+        port: None,
+        float_tolerance: None,
+        float_files: &[],
+        effects: None,
+        ready_secs: None,
+        ready_request: None,
+    })
+    .unwrap();
+    let again = std::fs::read_to_string(out.dir.join("add-again.body")).ok();
+    let replayed = replay(&repo, None);
+    let _ = std::fs::remove_dir_all(&repo);
+    assert_eq!(again.as_deref(), Some("2"), "{out:?}");
+    assert_eq!(replayed.passed, 2, "{:?}", replayed.failures);
+}
+
 #[test]
 fn a_ready_request_waits_until_the_routes_answer() {
     // The port accepting a connection is not the same as the app being ready: a framework answers
