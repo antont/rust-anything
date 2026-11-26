@@ -8,6 +8,7 @@
   "scripts": {
     "dev": "vp dev",
     "build": "vp build",
+    "postbuild": "node scripts/asset-bypass.mjs",
     "preview": "vp preview",
     "deploy": "void deploy",
     "cli-help": "node scripts/cli-help.mjs"
