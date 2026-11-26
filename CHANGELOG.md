@@ -8,7 +8,7 @@
   Examples and generated traps are still deduplicated. `app replay`, and the replays `app wire`
   and `app lift` run, send HTTP cases in that same case-name order: sorting file names put
   `add-again` before `add`, so a server with state answered differently than when recorded
-  (by @antont).
+  (#677 by @antont).
 - The table of saved settings in `docs/whole-apps.md` names the flag that clears `http`
   (`--no-http`), `http.port` (`--port 0`), `http.args` (`--no-args`) and `http.fresh` / `fresh`
   (`--no-fresh`) instead of saying they cannot be cleared
