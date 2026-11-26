@@ -6,7 +6,7 @@
   `T | null`, also through a type alias and `Promise<T | null>`. A call the binary wire refuses
   (such as `null` for an optional array), and every async call, used to get `undefined`, so
   `diff` failed with `expected {"ok":null}, got {"ok":{"$undefined":true}}`; the wire already
-  answered `null`. A declared `undefined` still answers `undefined` (by @antont).
+  answered `null`. A declared `undefined` still answers `undefined` (#675 by @antont).
 - The table of saved settings in `docs/whole-apps.md` names the flag that clears `http`
   (`--no-http`), `http.port` (`--port 0`), `http.args` (`--no-args`) and `http.fresh` / `fresh`
   (`--no-fresh`) instead of saying they cannot be cleared
