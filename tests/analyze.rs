@@ -114,6 +114,53 @@ fn risk_samples_are_distinct_lines() {
 }
 
 #[test]
+fn runtime_apis_a_port_must_reproduce_are_risks() {
+    let root = std::env::temp_dir().join(format!("ra-runtime-apis-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(root.join("src")).unwrap();
+    std::fs::write(
+        root.join("src/apis.ts"),
+        "export const words = (s: string) => [...new Intl.Segmenter('und', { granularity: 'word' }).segment(s)]\n\
+         export const when = (s: string) => Date.parse(s)\n\
+         export const host = (u: string) => new URL(u).host\n",
+    )
+    .unwrap();
+    // Look-alikes that need no runtime semantics: a path, an epoch number, the clock.
+    std::fs::write(
+        root.join("src/plain.ts"),
+        "import * as path from 'node:path'\n\
+         export const clean = (p: string) => path.normalize(p)\n\
+         export const epoch = () => new Date(0)\n",
+    )
+    .unwrap();
+    let report = analyze(&root).unwrap();
+    std::fs::remove_dir_all(&root).unwrap();
+    let samples = |id: &str, risk: Risk| {
+        unit(&report, id)
+            .risks
+            .iter()
+            .find(|r| r.risk == risk)
+            .map(|r| r.samples.clone())
+    };
+    let apis = "src/apis.ts";
+    assert_eq!(
+        samples(apis, Risk::Intl),
+        Some(vec!["src/apis.ts:1".to_string()])
+    );
+    assert_eq!(
+        samples(apis, Risk::DateParsing),
+        Some(vec!["src/apis.ts:2".to_string()])
+    );
+    assert_eq!(
+        samples(apis, Risk::WebApis),
+        Some(vec!["src/apis.ts:3".to_string()])
+    );
+    for risk in [Risk::Intl, Risk::DateParsing, Risk::WebApis] {
+        assert_eq!(samples("src/plain.ts", risk), None, "{risk:?}");
+    }
+}
+
+#[test]
 fn picks_status_and_bridge() {
     let report = mini();
     let fs = unit(&report, "packages/a/src/fs.ts");

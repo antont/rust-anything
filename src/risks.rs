@@ -50,6 +50,12 @@ pub enum Risk {
     /// PowerShell converts between types on its own: the left operand decides, `/` on integers
     /// gives a double, an integer that overflows becomes a double, `[int]` rounds to even.
     LooseConversion,
+    /// JS `Intl` and locale-aware string methods: word breaks, collation, normalization.
+    Intl,
+    /// `Date.parse` and `new Date(string)`: implementation-defined formats and local time.
+    DateParsing,
+    /// WHATWG `URL`/`URLSearchParams` and the encoding APIs (`TextEncoder`, `atob`).
+    WebApis,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize)]
@@ -99,6 +105,8 @@ impl Risk {
             Self::PipelineOutput | Self::CaseInsensitive | Self::LooseConversion => {
                 Severity::Medium
             }
+            Self::Intl | Self::DateParsing => Severity::High,
+            Self::WebApis => Severity::Medium,
         }
     }
 
@@ -132,6 +140,9 @@ impl Risk {
             Self::PipelineOutput => "Implicit output and the pipeline",
             Self::CaseInsensitive => "Case-insensitive comparison",
             Self::LooseConversion => "Implicit type conversion",
+            Self::Intl => "Intl and locale-aware strings",
+            Self::DateParsing => "Date parsing",
+            Self::WebApis => "URL and encoding APIs",
         }
     }
 
@@ -280,6 +291,30 @@ impl Risk {
                  casts round halves to even (`[int]2.5` is 2). `$null -eq $x` and `$x -eq $null` \
                  differ when `$x` is an array (the second filters it). Write each conversion out in \
                  Rust and record cases at the edges."
+            }
+            Self::Intl => {
+                "`Intl.Segmenter`, `Intl.Collator`, `normalize` and the `toLocale*` methods run on \
+                 the engine's ICU data. ICU4X (`icu_segmenter`, `icu_collator`, `icu_normalizer`) \
+                 covers them, but engines still differ at the edges: V8 splits a katakana compound \
+                 such as \"ドラゴンクエスト\" with its CJK dictionary where ICU4X keeps it whole. Record \
+                 CJK, Thai and accented inputs, and list a difference you accept in \
+                 `known-diffs.jsonl`."
+            }
+            Self::DateParsing => {
+                "`Date.parse` and `new Date(string)` accept implementation-defined formats: V8 \
+                 takes `Tue, 25 Nov 2026 10:00:00 GMT`, `May 1, 21` and \
+                 `Fri Sep 1 2021 08:43:51 (Coordinated Universal Time)`, rolls `2026-02-30` over \
+                 to 2 March, and reads a date-time without a zone in local time. No crate parses \
+                 the same set. Port the formats the data really holds, and test them with a \
+                 generator of date strings, not only the recorded cases: dates inside other \
+                 encodings rarely come out of `record` or `fuzz`."
+            }
+            Self::WebApis => {
+                "`new URL` and `URLSearchParams` follow the WHATWG URL standard: the `url` crate \
+                 does too (`host` with a default port dropped, IDNA to Punycode, `query_pairs` for \
+                 `searchParams`). `atob` validates its input before decoding, `TextDecoder` \
+                 replaces bad UTF-8 and drops a leading BOM, `btoa` takes Latin-1: port each \
+                 exactly, and record malformed inputs."
             }
         }
     }

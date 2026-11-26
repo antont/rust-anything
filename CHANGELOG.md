@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- `analyze` flags three more TS/JS risks: `Intl and locale-aware strings` (high: `Intl.*`,
+  `localeCompare`, `toLocaleLowerCase`, `normalize("NFC")`), `Date parsing` (high: `Date.parse`,
+  `new Date(string)`) and `URL and encoding APIs` (medium: `new URL`, `URLSearchParams`,
+  `TextEncoder`/`TextDecoder`, `atob`/`btoa`), each with guidance on the traps a port must match
+  (#678, #711 by @antont).
 - A napi export called without an optional structured argument, such as an array, now gets
   `None` on the JSON path that async calls always take, instead of failing with
   `invalid type: map, expected a sequence` before the port runs. A `serde_json::Value` parameter

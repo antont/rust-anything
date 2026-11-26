@@ -203,6 +203,11 @@ impl Collector {
     }
 }
 
+/// `Intl.Segmenter` and its kin, as the callee of a `new` or a call.
+fn is_intl_member(expr: &Expression<'_>) -> bool {
+    matches!(expr, Expression::StaticMemberExpression(m) if identifier(&m.object) == Some("Intl"))
+}
+
 fn identifier<'a>(expr: &Expression<'a>) -> Option<&'a str> {
     match expr {
         Expression::Identifier(id) => Some(id.name.as_str()),
@@ -276,6 +281,19 @@ impl<'a> Visit<'a> for Collector {
                     (Some("Math"), "round") | (_, "toFixed") => {
                         self.add(Risk::NumberSemantics, it.span);
                     }
+                    (Some("Intl"), _)
+                    | (_, "localeCompare" | "toLocaleLowerCase" | "toLocaleUpperCase") => {
+                        self.add(Risk::Intl, it.span);
+                    }
+                    // `s.normalize("NFC")` or `s.normalize()`, not `path.normalize(p)`.
+                    (_, "normalize")
+                        if it.arguments.is_empty()
+                            || string_arg(it.arguments.first())
+                                .is_some_and(|f| f.starts_with("NF")) =>
+                    {
+                        self.add(Risk::Intl, it.span);
+                    }
+                    (Some("Date"), "parse") => self.add(Risk::DateParsing, it.span),
                     (_, "matchAll" | "exec") => self.add(Risk::StringOffsets, it.span),
                     (_, method) if STRING_OFFSET_METHODS.contains(&method) => {
                         self.add(Risk::StringOffsets, it.span);
@@ -287,6 +305,7 @@ impl<'a> Visit<'a> for Collector {
                 "eval" => self.add(Risk::DynamicCode, it.span),
                 "Date" => self.add(Risk::ClockAndRandom, it.span),
                 "parseInt" | "parseFloat" => self.add(Risk::NumberSemantics, it.span),
+                "atob" | "btoa" => self.add(Risk::WebApis, it.span),
                 "require" => match string_arg(it.arguments.first()) {
                     Some(specifier) => self.import(specifier, false, true),
                     None => self.add(Risk::DynamicCode, it.span),
@@ -308,11 +327,22 @@ impl<'a> Visit<'a> for Collector {
             }
             Some("Map" | "Set") => self.add(Risk::OrderedCollections, it.span),
             Some("Date") if it.arguments.is_empty() => self.add(Risk::ClockAndRandom, it.span),
+            // One argument that is not a number literal: a string the engine parses.
+            Some("Date")
+                if it.arguments.len() == 1
+                    && !matches!(it.arguments.first(), Some(Argument::NumericLiteral(_))) =>
+            {
+                self.add(Risk::DateParsing, it.span);
+            }
+            Some("URL" | "URLSearchParams" | "TextEncoder" | "TextDecoder") => {
+                self.add(Risk::WebApis, it.span);
+            }
             Some("Function") => self.add(Risk::DynamicCode, it.span),
             Some("Proxy" | "WeakRef" | "FinalizationRegistry") => {
                 self.add(Risk::Reflection, it.span);
             }
             Some("Promise") => self.add(Risk::Async, it.span),
+            _ if is_intl_member(&it.callee) => self.add(Risk::Intl, it.span),
             _ => {}
         }
         walk::walk_new_expression(self, it);
@@ -488,6 +518,27 @@ mod tests {
         assert_eq!(facts.risks[&Risk::StringOffsets], [6]);
         assert_eq!(facts.risks[&Risk::OrderedCollections], [7]);
         assert_eq!(facts.parse_errors, 0);
+    }
+
+    #[test]
+    fn flags_runtime_apis_a_port_must_reproduce() {
+        let facts = scan(
+            "t.ts",
+            "const seg = new Intl.Segmenter('und', { granularity: 'word' })\n\
+             export const same = (a: string, b: string) => a.localeCompare(b) === 0\n\
+             export const nfc = (s: string) => s.normalize('NFC')\n\
+             import * as path from 'node:path'\n\
+             export const p = (s: string) => path.normalize(s)\n\
+             export const ms = (s: string) => Date.parse(s)\n\
+             export const d = (s: string) => new Date(s)\n\
+             export const epoch = () => new Date(0)\n\
+             export const host = (u: string) => new URL(u).host\n\
+             export const b = (s: string) => atob(s)\n\
+             export const t = (b: Uint8Array) => new TextDecoder().decode(b)\n",
+        );
+        assert_eq!(facts.risks[&Risk::Intl], [1, 2, 3]);
+        assert_eq!(facts.risks[&Risk::DateParsing], [6, 7]);
+        assert_eq!(facts.risks[&Risk::WebApis], [9, 10, 11]);
     }
 
     #[test]
