@@ -87,7 +87,7 @@ const decode = (s: string) =>
 
 function ogImageFor(path: string): string {
   const p = stripLocale(path)
-  return p.startsWith('/docs/') ? `/og${p}.png` : '/og-home.png'
+  return p.startsWith('/docs/') ? `/og${p}.png` : '/og/index.png'
 }
 
 export default defineMiddleware(async (c, next) => {
