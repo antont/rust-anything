@@ -13,7 +13,8 @@ use crate::MIN_RUST;
 use std::fmt::Write as _;
 
 use crate::bridge::{Kind, Manifest, RType, param_type, snake_case};
-use crate::ts::exports::ExportedFn;
+use crate::ts::exports::{ExportedFn, LocalType};
+use crate::ts::shape::Shape;
 
 /// A port function, as declared in `port.rs`.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -545,10 +546,22 @@ pub fn lib_rs(m: &Manifest, api: &PortApi, modules: &Modules) -> String {
             out.push_str(NAPI_RUN_ASYNC);
         }
     }
+    let mut scopes: std::collections::HashMap<&str, Vec<LocalType>> =
+        std::collections::HashMap::new();
     for f in &api.functions {
         out.push('\n');
         let _ = writeln!(out, "/// `{}`.", f.js_name);
-        bind(&mut out, m.kind, f);
+        let null = m
+            .exports
+            .iter()
+            .find(|e| e.name == f.js_name)
+            .is_some_and(|e| {
+                let types = scopes
+                    .entry(e.file.as_str())
+                    .or_insert_with(|| crate::codegen_tswire::types_for(m, &e.file));
+                none_is_null(Some(&e.returns), types)
+            });
+        bind(&mut out, m.kind, f, null);
     }
     for c in &api.classes {
         bind_class(&mut out, m.kind, c);
@@ -556,8 +569,39 @@ pub fn lib_rs(m: &Manifest, api: &PortApi, modules: &Modules) -> String {
     out
 }
 
+/// Whether `None` from the port must reach JS as `null` rather than `undefined`: the source
+/// declares `T | null` and not `undefined`, through aliases and `Promise` as the binary wire reads
+/// them (`OptJs`), so both paths of one function agree.
+fn none_is_null(returns: Option<&str>, types: &[LocalType]) -> bool {
+    let Some(returns) = returns else { return false };
+    let mut members = Vec::new();
+    flatten_union(&crate::ts::shape::parse(returns), types, 0, &mut members);
+    // A member left unresolved (an import, `any`, too deep) may be `undefined`: keep `undefined`.
+    members.iter().any(|m| matches!(m, Shape::Null))
+        && !members
+            .iter()
+            .any(|m| matches!(m, Shape::Undefined | Shape::Any | Shape::Ref(..)))
+}
+
+/// The members of a union, with named types resolved from `types` and nested unions flattened.
+fn flatten_union(s: &Shape, types: &[LocalType], depth: usize, out: &mut Vec<Shape>) {
+    match s {
+        _ if depth > 6 => out.push(Shape::Any),
+        Shape::Union(members) => {
+            for m in members {
+                flatten_union(m, types, depth + 1, out);
+            }
+        }
+        Shape::Ref(name, args) => match crate::ts::shape::resolve(name, args, types) {
+            Shape::Ref(n, _) if n == *name => out.push(s.clone()),
+            resolved => flatten_union(&resolved, types, depth + 1, out),
+        },
+        _ => out.push(s.clone()),
+    }
+}
+
 /// The body of a binding: decode structured arguments, call, encode the result.
-fn body(f: &PortFn, target: &str, kind: Kind, constructor: bool) -> String {
+fn body(f: &PortFn, target: &str, kind: Kind, constructor: bool, none_is_null: bool) -> String {
     let mut body = String::new();
     for (n, t) in &f.params {
         // The port's own type names may only resolve inside `port.rs`: let inference pick the type.
@@ -583,6 +627,10 @@ fn body(f: &PortFn, target: &str, kind: Kind, constructor: bool) -> String {
         (true, _, Kind::Wasm) => "Ok(out)",
         (false, Wire::Json, _) => "crate::js::to_json(&out)",
         (false, Wire::Units, Kind::Napi) => "Ok(napi::bindgen_prelude::Uint16Array::new(out))",
+        // napi turns `None` into `null` itself.
+        (false, Wire::Native, Kind::Napi) if option_inner(&f.ret).is_some() && none_is_null => {
+            "Ok(out)"
+        }
         (false, Wire::Native, Kind::Napi) if option_inner(&f.ret).is_some() => {
             "Ok(out.map_or(napi::bindgen_prelude::Either::B(()), napi::bindgen_prelude::Either::A))"
         }
@@ -602,12 +650,13 @@ fn binding_params(f: &PortFn) -> Vec<String> {
         .collect()
 }
 
-fn binding_ret(f: &PortFn, kind: Kind) -> String {
+fn binding_ret(f: &PortFn, kind: Kind, none_is_null: bool) -> String {
     match (wire(&f.ret), kind) {
         (Wire::Json, _) => "String".to_string(),
         (Wire::Units, Kind::Napi) => "napi::bindgen_prelude::Uint16Array".to_string(),
-        // napi turns `None` into `null`; JS code returning nothing gives `undefined`.
-        (Wire::Native, Kind::Napi) if option_inner(&f.ret).is_some() => {
+        // napi turns `None` into `null`, right for a source declared `T | null`; otherwise
+        // `undefined`, as JS code returning nothing gives.
+        (Wire::Native, Kind::Napi) if option_inner(&f.ret).is_some() && !none_is_null => {
             format!(
                 "napi::bindgen_prelude::Either<{}, ()>",
                 option_inner(&f.ret).unwrap_or_default()
@@ -653,7 +702,8 @@ fn bind_class(out: &mut String, kind: Kind, c: &PortClass) {
                     &c.constructor,
                     &format!("port::{name}::new"),
                     kind,
-                    true
+                    true,
+                    false
                 ))
             );
             for (m, mutable) in &c.methods {
@@ -669,7 +719,7 @@ fn bind_class(out: &mut String, kind: Kind, c: &PortClass) {
                     out,
                     "    pub fn {}({sig}) -> napi::Result<{}> {{",
                     m.rust_name,
-                    binding_ret(m, kind)
+                    binding_ret(m, kind, false)
                 );
                 let borrow = if *mutable {
                     "&mut self.inner"
@@ -680,7 +730,13 @@ fn bind_class(out: &mut String, kind: Kind, c: &PortClass) {
                 let _ = writeln!(
                     out,
                     "        run(move || {{\n{}        }})\n    }}",
-                    indent(&body(m, &format!("inner.{}", m.rust_name), kind, false))
+                    indent(&body(
+                        m,
+                        &format!("inner.{}", m.rust_name),
+                        kind,
+                        false,
+                        false
+                    ))
                 );
             }
             out.push_str("}\n");
@@ -694,7 +750,8 @@ fn bind_class(out: &mut String, kind: Kind, c: &PortClass) {
                     &c.constructor,
                     &format!("port::{name}::new"),
                     kind,
-                    true
+                    true,
+                    false
                 ))
             );
             for (m, mutable) in &c.methods {
@@ -712,8 +769,14 @@ fn bind_class(out: &mut String, kind: Kind, c: &PortClass) {
                     out,
                     "\nfn {snake}_{}_inner({sig}) -> Result<{}, String> {{\n{}}}",
                     m.rust_name.trim_start_matches("r#"),
-                    binding_ret(m, kind),
-                    dedent(&body(m, &format!("inner.{}", m.rust_name), kind, false))
+                    binding_ret(m, kind, false),
+                    dedent(&body(
+                        m,
+                        &format!("inner.{}", m.rust_name),
+                        kind,
+                        false,
+                        false
+                    ))
                 );
             }
             let _ = writeln!(
@@ -753,7 +816,7 @@ fn bind_class(out: &mut String, kind: Kind, c: &PortClass) {
                     out,
                     "    pub fn {}({sig}) -> Result<{}, JsError> {{",
                     m.rust_name,
-                    binding_ret(m, kind)
+                    binding_ret(m, kind, false)
                 );
                 let _ = writeln!(
                     out,
@@ -776,10 +839,16 @@ fn dedent(text: &str) -> String {
         .collect()
 }
 
-fn bind(out: &mut String, kind: Kind, f: &PortFn) {
+fn bind(out: &mut String, kind: Kind, f: &PortFn, none_is_null: bool) {
     let params = binding_params(f).join(", ");
-    let ret = binding_ret(f, kind);
-    let body = body(f, &format!("port::{}", f.rust_name), kind, false);
+    let ret = binding_ret(f, kind, none_is_null);
+    let body = body(
+        f,
+        &format!("port::{}", f.rust_name),
+        kind,
+        false,
+        none_is_null,
+    );
     let args: Vec<&str> = f.params.iter().map(|(n, _)| n.as_str()).collect();
     let asyncness = if f.is_async { "async " } else { "" };
     match kind {
@@ -1326,6 +1395,59 @@ mod tests {
             ),
             ("plainName", "Vec<u16>", false)
         );
+    }
+
+    #[test]
+    fn none_is_null_only_where_the_source_says_null() {
+        let none: Vec<LocalType> = Vec::new();
+        assert!(none_is_null(
+            Some("\"length\" | \"other-work\" | null"),
+            &none
+        ));
+        assert!(none_is_null(Some("string | null"), &none));
+        assert!(none_is_null(Some("null"), &none));
+        assert!(!none_is_null(Some("string | undefined"), &none));
+        assert!(!none_is_null(Some("string | null | undefined"), &none));
+        assert!(!none_is_null(Some("string"), &none));
+        assert!(!none_is_null(None, &none));
+        // The wire resolves aliases and unwraps `Promise`; the other path must too.
+        let types = crate::ts::exports::local_types(
+            "a.ts",
+            "type Maybe = string | null\n\
+             type Loose = Maybe | undefined\n\
+             export function f(): Maybe { return null }\n",
+        );
+        assert!(none_is_null(Some("Maybe"), &types));
+        assert!(none_is_null(Some("Promise<string | null>"), &types));
+        assert!(none_is_null(Some("Promise<Maybe>"), &types));
+        assert!(!none_is_null(Some("Loose"), &types));
+        assert!(!none_is_null(Some("Promise<string | undefined>"), &types));
+        assert!(!none_is_null(Some("Unknown"), &types));
+        // A member that does not resolve may be `undefined`: keep the old answer.
+        assert!(!none_is_null(Some("string | null | Unknown"), &types));
+        assert!(!none_is_null(Some("Promise<Maybe | Unknown>"), &types));
+        // So may one past the depth limit.
+        let chain = (0..8)
+            .map(|i| format!("type D{i} = D{}\n", i + 1))
+            .chain(["type D8 = string | null\n".to_string()])
+            .collect::<String>();
+        let deep = crate::ts::exports::local_types("d.ts", &chain);
+        assert!(none_is_null(Some("D7"), &deep));
+        assert!(!none_is_null(Some("D0"), &deep));
+    }
+
+    #[test]
+    fn binds_an_option_by_the_source_return_type() {
+        let f = &parse_port(
+            "/// Port of `refusal`.\npub fn refusal(raw: String) -> Result<Option<String>, String> {\n    Ok(None)\n}\n",
+        )
+        .functions[0];
+        let (mut null, mut undefined) = (String::new(), String::new());
+        bind(&mut null, Kind::Napi, f, true);
+        bind(&mut undefined, Kind::Napi, f, false);
+        assert!(null.contains("-> napi::Result<Option<String>>"), "{null}");
+        assert!(!null.contains("Either"), "{null}");
+        assert!(undefined.contains("Either<String, ()>"), "{undefined}");
     }
 
     #[test]
