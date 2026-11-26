@@ -9,6 +9,16 @@
   and `app lift` run, send HTTP cases in that same case-name order: sorting file names put
   `add-again` before `add`, so a server with state answered differently than when recorded
   (#677 by @antont).
+- The generated `src/utf16.rs` has `slice_units`, JS `slice` on code units with a cut surrogate
+  pair kept, and `bridge`'s string-offsets note says to return such a substring through
+  `js::utf16_string(utf16::slice_units(..))`. `utf16::slice`, which the note pointed to before,
+  turns a lone surrogate into U+FFFD, so a port that followed it failed `diff` on the cases the
+  helpers exist for (`head("😀")` → `{"$utf16":[55357]}` in JS) (#676 by @antont).
+- A napi port function returning `Option<T>` answers `None` as `null` when its TS export declares
+  `T | null`, also through a type alias and `Promise<T | null>`. A call the binary wire refuses
+  (such as `null` for an optional array), and every async call, used to get `undefined`, so
+  `diff` failed with `expected {"ok":null}, got {"ok":{"$undefined":true}}`; the wire already
+  answered `null`. A declared `undefined` still answers `undefined` (#675 by @antont).
 - The table of saved settings in `docs/whole-apps.md` names the flag that clears `http`
   (`--no-http`), `http.port` (`--port 0`), `http.args` (`--no-args`) and `http.fresh` / `fresh`
   (`--no-fresh`) instead of saying they cannot be cleared
