@@ -1081,3 +1081,74 @@ print("\n".join(out))
         String::from_utf8_lossy(&output.stderr)
     );
 }
+
+#[test]
+fn napi_substring_keeps_half_a_surrogate_pair() {
+    // JS `slice` can cut a surrogate pair and hand back the lone half. A port that follows the
+    // bridge's advice for string offsets must give the same string, not U+FFFD.
+    if !common::have("node") {
+        return;
+    }
+    let root = project(
+        "napi-utf16",
+        &[
+            ("package.json", r#"{"name":"head","version":"0.1.0"}"#),
+            (
+                "src/head.ts",
+                "export function head(s: string): string { return s.slice(0, 1) }\n",
+            ),
+        ],
+    );
+    let dir = root.join("port");
+    let outcome = bridge::bridge(&bridge::Options {
+        root: &root,
+        unit: "src/head.ts",
+        kind: Some(Kind::Napi),
+        out: Some(dir.clone()),
+        name: None,
+        force: false,
+        keep: Vec::new(),
+        lang: None,
+        batch: Vec::new(),
+        as_json: Vec::new(),
+        allocator: Default::default(),
+    })
+    .unwrap();
+    assert!(
+        outcome.notes.iter().any(|n| n.contains("slice_units")),
+        "{:#?}",
+        outcome.notes
+    );
+    // Port it as the note says: the result becomes a `serde_json::Value` that can hold a lone
+    // surrogate, and `refresh` regenerates the binding for the new signature.
+    let port = std::fs::read_to_string(dir.join("src/port.rs")).unwrap();
+    let stub = "-> Result<String, String> {\n    let _ = &s;\n    \
+                unimplemented!(\"port `head` from src/head.ts\")";
+    assert!(port.contains(stub), "{port}");
+    let port = port.replacen(
+        stub,
+        "-> Result<serde_json::Value, String> {\n    \
+         Ok(crate::js::utf16_string(crate::utf16::slice_units(&crate::utf16::units(&s), 0, 1)))",
+        1,
+    );
+    std::fs::write(dir.join("src/port.rs"), port).unwrap();
+    bridge::refresh(&dir).unwrap();
+    harness::build(&dir).unwrap();
+    let script = r#"
+const m = require(process.argv[1])
+const units = r => Array.from({ length: r.length }, (_, i) => r.charCodeAt(i))
+console.log(JSON.stringify(['\uD83D\uDE00', 'a\uD83D\uDE00', ''].map(s => units(m.head(s)))))
+"#;
+    let output = Command::new("node")
+        .args(["-e", script])
+        .arg(dir.join("index.cjs"))
+        .output()
+        .unwrap();
+    std::fs::remove_dir_all(&root).unwrap();
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout).trim(),
+        "[[55357],[97],[]]",
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}

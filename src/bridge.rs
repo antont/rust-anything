@@ -1521,7 +1521,7 @@ pub fn bridge(opts: &Options) -> Result<Outcome> {
         crate_dir.display()
     )];
     if utf16 {
-        notes.push("The unit works with string offsets: src/utf16.rs has UTF-16 helpers that match JS indexing.".into());
+        notes.push("The unit works with string offsets: src/utf16.rs has UTF-16 helpers that match JS indexing. A substring that can cut a surrogate pair goes back to JS as a `serde_json::Value` built by `js::utf16_string(utf16::slice_units(..))`, not a `String` (run `refresh` after changing the signature).".into());
     }
     for j in &js_only {
         notes.push(format!(
@@ -1856,11 +1856,19 @@ pub fn units(s: &str) -> Vec<u16> {
     s.encode_utf16().collect()
 }
 
-/// The string `units[start..end]` decodes to, like JS `slice` (lone surrogates become U+FFFD).
+/// The string `units[start..end]` decodes to. Unlike JS `slice`, a cut surrogate pair becomes
+/// U+FFFD: to hand a substring back to JS exactly, keep `slice_units` and return it through
+/// `js::utf16_string` (a `serde_json::Value`), which carries a lone surrogate as JS has it.
 pub fn slice(units: &[u16], start: usize, end: usize) -> String {
+    String::from_utf16_lossy(slice_units(units, start, end))
+}
+
+/// JS `slice` on code units, exactly: `units[start..end]`, clamped to the string, a lone
+/// surrogate kept.
+pub fn slice_units(units: &[u16], start: usize, end: usize) -> &[u16] {
     let end = end.min(units.len());
     let start = start.min(end);
-    String::from_utf16_lossy(&units[start..end])
+    &units[start..end]
 }
 
 /// JS `haystack.indexOf(needle, from)`, in UTF-16 code units.
@@ -1911,6 +1919,9 @@ mod tests {
         assert_eq!(index_of(&s, &units("b"), 0), Some(3));
         assert_eq!(last_index_of(&s, &units("a")), Some(0));
         assert_eq!(slice(&s, 3, 4), "b");
+        // A cut surrogate pair: JS keeps the half, `slice_units` too, `slice` cannot.
+        assert_eq!(slice_units(&units("😀"), 0, 1), &[0xD83D]);
+        assert_eq!(slice(&units("😀"), 0, 1), "\u{FFFD}");
         assert_eq!(byte_offset("a👍b", 3), 5);
         assert_eq!(utf16_offset("a👍b", 5), 3);
     }
