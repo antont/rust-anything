@@ -489,7 +489,8 @@ struct WireFn<'m> {
     rust: String,
 }
 
-fn types_for(m: &Manifest, file: &str) -> Vec<LocalType> {
+/// The types in scope in `file`: its own and those it imports.
+pub(crate) fn types_for(m: &Manifest, file: &str) -> Vec<LocalType> {
     let text = std::fs::read_to_string(m.root.join(file)).unwrap_or_default();
     crate::bridge::types_in_scope(&m.root, file, &text)
 }

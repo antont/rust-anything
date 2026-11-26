@@ -1081,3 +1081,69 @@ print("\n".join(out))
         String::from_utf8_lossy(&output.stderr)
     );
 }
+
+#[test]
+fn napi_none_answers_null_where_the_source_declares_null() {
+    // A call the binary wire refuses (`null` for an optional array, which is not `T | null`) takes the JSON path, and
+    // async calls always do: `None` must still reach JS as the `null` the source declares,
+    // through a type alias and `Promise` too, and stay `undefined` where it says `undefined`.
+    if !common::have("node") {
+        return;
+    }
+    let root = project(
+        "napi-none",
+        &[
+            ("package.json", r#"{"name":"none","version":"0.1.0"}"#),
+            (
+                "src/none.ts",
+                "type Verdict = \"named\" | null\n\
+                 export function direct(names?: string[]): \"named\" | null { return names?.length ? \"named\" : null }\n\
+                 export function aliased(names?: string[]): Verdict { return names?.length ? \"named\" : null }\n\
+                 export async function later(names?: string[]): Promise<\"named\" | null> { return names?.length ? \"named\" : null }\n\
+                 export function loose(names?: string[]): \"named\" | undefined { return names?.length ? \"named\" : undefined }\n",
+            ),
+        ],
+    );
+    let dir = root.join("port");
+    bridge::bridge(&bridge::Options {
+        root: &root,
+        unit: "src/none.ts",
+        kind: Some(Kind::Napi),
+        out: Some(dir.clone()),
+        name: None,
+        force: false,
+        keep: Vec::new(),
+        lang: None,
+        batch: Vec::new(),
+        as_json: Vec::new(),
+        allocator: Default::default(),
+    })
+    .unwrap();
+    let body = "Ok(names.filter(|n| !n.is_empty()).map(|_| \"named\".to_string()))";
+    let mut port = std::fs::read_to_string(dir.join("src/port.rs")).unwrap();
+    for name in ["direct", "aliased", "later", "loose"] {
+        let stub = format!("unimplemented!(\"port `{name}` from src/none.ts\")");
+        assert!(port.contains(&stub), "{port}");
+        port = port.replacen(&stub, body, 1);
+    }
+    std::fs::write(dir.join("src/port.rs"), &port).unwrap();
+    harness::build(&dir).unwrap();
+    let script = r#"
+const m = require(process.argv[1])
+const show = v => v === null ? 'null' : v === undefined ? 'undefined' : v
+Promise.all([m.direct(null), m.aliased(null), m.later(null), m.loose(null), m.direct(['a'])])
+  .then(vs => console.log(vs.map(show).join(',')))
+"#;
+    let output = Command::new("node")
+        .args(["-e", script])
+        .arg(dir.join("index.cjs"))
+        .output()
+        .unwrap();
+    std::fs::remove_dir_all(&root).unwrap();
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout).trim(),
+        "null,null,null,undefined,named",
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
