@@ -302,8 +302,8 @@ impl Risk {
             }
             Self::DateParsing => {
                 "`Date.parse` and `new Date(string)` accept implementation-defined formats: V8 \
-                 takes `Tue, 25 Nov 2026 10:00:00 GMT`, `May 1, 21` and \
-                 `Fri Sep 1 2021 08:43:51 (Coordinated Universal Time)`, rolls `2026-02-30` over \
+                 takes `Wed, 25 Nov 2026 10:00:00 GMT`, `May 1, 21` and \
+                 `Wed Sep 1 2021 08:43:51 (Coordinated Universal Time)`, rolls `2026-02-30` over \
                  to 2 March, and reads a date-time without a zone in local time. No crate parses \
                  the same set. Port the formats the data really holds, and test them with a \
                  generator of date strings, not only the recorded cases: dates inside other \
