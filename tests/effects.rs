@@ -722,6 +722,8 @@ fn shadow_lets_the_original_mail_once_and_sends_the_build_mail_to_a_sink() {
                 keep: false,
                 ported: &[],
                 allow_fallback: &[],
+                ignore_headers: &[],
+                show_paths: false,
                 idle_secs: None,
                 progress: None,
             })

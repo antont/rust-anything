@@ -701,10 +701,17 @@ enum AppCmd {
         /// on it. A fallback names its reason after `METHOD path` in `RUST_ANYTHING_FALLBACK_LOG`.
         #[arg(long, value_name = "ROUTE")]
         ported: Vec<String>,
-        /// A fallback a `--ported` route makes by design, as `ROUTE=REASON` (`GET /me=Identity`);
-        /// repeatable.
+        /// A fallback a `--ported` route makes by design, as `ROUTE=REASON` (`GET /me=Identity`),
+        /// or `*=REASON` for every ported route; repeatable. The reason is the one word after
+        /// `METHOD path` on the fallback's log line.
         #[arg(long, value_name = "ROUTE=REASON")]
         allow_fallback: Vec<String>,
+        /// A response header not to compare (`x-request-id`); repeatable.
+        #[arg(long, value_name = "NAME")]
+        ignore_header: Vec<String>,
+        /// Name each mismatch by its path, not a hash of it, in the terminal and the log.
+        #[arg(long)]
+        show_paths: bool,
         /// Seconds to wait for each answer (default: the one saved by `app record`, 30 seconds
         /// unless it was changed).
         #[arg(long)]
@@ -1953,6 +1960,8 @@ fn run_app(command: AppCmd) -> Result<ExitCode> {
             idle,
             ported,
             allow_fallback,
+            ignore_header,
+            show_paths,
             timeout,
             keep,
             json,
@@ -1986,6 +1995,8 @@ fn run_app(command: AppCmd) -> Result<ExitCode> {
                 keep,
                 ported: &ported,
                 allow_fallback: &allow_fallback,
+                ignore_headers: &ignore_header,
+                show_paths,
                 idle_secs: idle,
                 progress: Some(&progress),
             })?;

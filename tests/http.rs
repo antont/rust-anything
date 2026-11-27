@@ -2179,7 +2179,7 @@ http.createServer((req, res) => {
     res.writeHead(200, { "content-type": "text/plain" });
     return res.end("hello");
   }
-  fs.appendFileSync(process.env.RUST_ANYTHING_FALLBACK_LOG, req.method + " " + req.url + " Unported\n");
+  fs.appendFileSync(process.env.RUST_ANYTHING_FALLBACK_LOG, req.method + " " + req.url + " Unported req-" + Date.now() + "\n");
   if (process.env.RUST_ANYTHING_SHADOW) {
     res.writeHead(599);
     return res.end();
@@ -2258,6 +2258,8 @@ fn shadow_counts_what_a_strangler_hands_to_the_original_and_writes_once() {
                 keep: false,
                 ported: &[],
                 allow_fallback: &[],
+                ignore_headers: &[],
+                show_paths: false,
                 idle_secs: None,
                 progress: None,
             })
@@ -2353,6 +2355,8 @@ fn shadow_strangler(ported: &[&str], allowed: &[&str]) -> rust_anything::app_sha
                 keep: false,
                 ported: &ported,
                 allow_fallback: &allowed,
+                ignore_headers: &[],
+                show_paths: false,
                 idle_secs: Some(1),
                 progress: None,
             })
@@ -2421,6 +2425,13 @@ fn shadow_fails_a_ported_route_that_fell_back_or_was_never_answered() {
         ],
         "an allowed fallback is not a failure, but the route was still never answered"
     );
+
+    let anywhere = shadow_strangler(&["POST /add"], &["*=Unported"]);
+    assert_eq!(
+        anywhere.ported[0].problems,
+        ["never answered by the build"],
+        "`*=REASON` allows the reason on every ported route"
+    );
 }
 
 #[test]
@@ -2451,6 +2462,8 @@ fn shadow_answers_with_the_original_and_logs_the_build_mismatch_as_a_shape() {
                 keep: true,
                 ported: &[],
                 allow_fallback: &[],
+                ignore_headers: &[],
+                show_paths: false,
                 idle_secs: None,
                 progress: None,
             })

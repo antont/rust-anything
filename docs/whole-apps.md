@@ -234,19 +234,25 @@ rust-anything app shadow . --build ./server-rs --upstream 127.0.0.1:3000 --keep
   it (it answers 599), so a write runs once, on the original that answered the client. A front
   door generated before this keeps forwarding: add the same check to its `proxy`, or generate it
   again.
-- A fallback line can name its reason after the path (`GET /me Identity`); the summary counts
-  fallbacks by reason. `--ported 'GET /users/{id}'` (repeatable, the syntax of
+- Every line the build appends to its fallback log during a request counts: one or more lines make
+  the request one fallback. A line can name its reason as the word after the path
+  (`GET /me Identity`); anything after that word (a request id, a message) is left out, and the
+  summary counts fallbacks by reason. `--ported 'GET /users/{id}'` (repeatable, the syntax of
   `app wire --route`) names a route the build must answer itself: the run fails if a request fell
   back on it, or if no request reached the build on it, so a port that proxies everything cannot
   pass. `--allow-fallback 'GET /me=Identity'` lets a ported route fall back for one reason by
-  design (a signed-out caller left to the original).
+  design (a signed-out caller left to the original), and `--allow-fallback '*=Identity'` lets
+  every ported route do so.
+- `--ignore-header x-request-id` (repeatable) leaves a header out of the comparison, for one that
+  differs on every answer but was the same in the recording's two runs.
 - `--idle 5` stops once no request has come for 5 seconds after the first one, for a test suite
   as the client: point it at `--listen`, run it, and shadow ends with its summary.
 - Each mismatch is a line in `rust/app-cases/shadow/mismatches.jsonl` with the method, a hash of
   the path and, for each field that differed (`body`, `status`, `header content-type`), its
   shape as `app replay --redact` writes it: where it first differs, kind, line and column,
   lengths, never the values. The terminal shows the same, and at the end the distinct
-  differences with how many requests each covers. `--keep` appends the request itself to
+  differences with how many requests each covers. `--show-paths` names each mismatch by its path
+  instead, in the terminal and the log, for debugging where the paths are not private. `--keep` appends the request itself to
   `rust/app-cases/shadow/inputs.jsonl`, which `app record --inputs` turns into a case, so a
   mismatch seen live is replayed with the full diff from then on.
 - It runs until Ctrl-C; `--requests 100` stops after 100 requests and exits 1 if any mismatched.

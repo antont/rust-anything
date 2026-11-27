@@ -52,8 +52,13 @@ pub struct ShadowOptions<'a> {
     /// Routes the build must answer itself (`GET /users/{id}`): one that a request fell back on,
     /// or that no request reached the build on, fails the run.
     pub ported: &'a [String],
-    /// Fallbacks a ported route may make by design, as `ROUTE=REASON` (`GET /me=Identity`).
+    /// Fallbacks a ported route may make by design, as `ROUTE=REASON` (`GET /me=Identity`), or
+    /// `*=REASON` for every ported route.
     pub allow_fallback: &'a [String],
+    /// Headers not compared at all, such as a request id that differs on every answer.
+    pub ignore_headers: &'a [String],
+    /// Name a mismatch by its path instead of a hash of it.
+    pub show_paths: bool,
     /// Stop when no request came for this many seconds after the first one.
     pub idle_secs: Option<u64>,
     pub progress: Option<&'a dyn Fn(Event)>,
@@ -68,13 +73,15 @@ pub struct ShadowOutcome {
     /// for a build that does not count its fallbacks.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub fallbacks: Option<usize>,
-    /// Fallbacks by the reason the build wrote after `METHOD path` (`unnamed` for none).
+    /// Fallbacks by the reason the build wrote after `METHOD path`: its next word, `unnamed` for
+    /// none.
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     pub reasons: BTreeMap<String, usize>,
     /// Each `--ported` route: how often the build answered it and fell back on it.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub ported: Vec<Ported>,
-    /// One per mismatching request, as shapes: the path is hashed and no value is kept.
+    /// One per mismatching request, as shapes: the path is hashed (unless `show_paths`) and no
+    /// value is kept.
     pub mismatches: Vec<Failure>,
     /// The distinct differences among the mismatches, most requests first.
     #[serde(skip_serializing_if = "Vec::is_empty")]
@@ -104,14 +111,11 @@ impl ShadowOutcome {
     }
 }
 
-/// The reason on a fallback line, `METHOD path [reason]`.
+/// The reason on a fallback line, `METHOD path [reason [anything else]]`: one word, so a request
+/// id or a message after it does not split one reason into many.
 fn reason(line: &str) -> String {
-    let mut fields = line.splitn(3, ' ');
-    let _ = (fields.next(), fields.next());
-    fields
-        .next()
-        .map(str::trim)
-        .filter(|r| !r.is_empty())
+    line.split_whitespace()
+        .nth(2)
         .unwrap_or("unnamed")
         .to_string()
 }
@@ -157,6 +161,7 @@ fn shape(field: impl Into<String>, mut at: At) -> Problem {
 fn compare(
     norm: &Normalizers,
     noisy: &BTreeSet<String>,
+    ignored: &BTreeSet<String>,
     original: &Resp,
     build: &Resp,
 ) -> Vec<Problem> {
@@ -168,7 +173,7 @@ fn compare(
         ));
     }
     for (k, expected) in &original.headers {
-        if http::is_skipped_header(k) {
+        if http::is_skipped_header(k) || ignored.contains(&k.to_ascii_lowercase()) {
             continue;
         }
         let at = match build.headers.get(k) {
@@ -234,16 +239,33 @@ pub fn shadow(opts: &ShadowOptions) -> Result<ShadowOutcome> {
         .map(|r| Route::parse(r))
         .collect::<Result<_>>()
         .context("--ported")?;
-    let allowed: Vec<(Route, String)> = opts
+    // `None` for `*`: the reason is allowed on every ported route.
+    let allowed: Vec<(Option<Route>, String)> = opts
         .allow_fallback
         .iter()
-        .map(|a| -> Result<(Route, String)> {
+        .map(|a| -> Result<(Option<Route>, String)> {
             let (route, reason) = a.rsplit_once('=').with_context(|| {
-                format!("--allow-fallback `{a}`: give ROUTE=REASON, e.g. `GET /me=Identity`")
+                format!(
+                    "--allow-fallback `{a}`: give ROUTE=REASON or *=REASON, e.g. `GET /me=Identity`"
+                )
             })?;
-            Ok((Route::parse(route)?, reason.trim().to_string()))
+            let reason = reason.trim();
+            ensure!(
+                !reason.is_empty() && !reason.contains(char::is_whitespace),
+                "--allow-fallback `{a}`: the reason is one word, as the fallback log's"
+            );
+            let route = match route.trim() {
+                "*" => None,
+                route => Some(Route::parse(route)?),
+            };
+            Ok((route, reason.to_string()))
         })
         .collect::<Result<_>>()?;
+    let ignored: BTreeSet<String> = opts
+        .ignore_headers
+        .iter()
+        .map(|h| h.trim().to_ascii_lowercase())
+        .collect();
     ensure!(
         opts.idle_secs != Some(0),
         "--idle must be at least 1 second"
@@ -394,13 +416,13 @@ pub fn shadow(opts: &ShadowOptions) -> Result<ShadowOutcome> {
                     outcome.ported[i].answered += 1;
                 }
                 let problems = match built {
-                    Ok((built, _)) => compare(&norm, &noisy, &answer, &built),
+                    Ok((built, _)) => compare(&norm, &noisy, &ignored, &answer, &built),
                     Err(_) => vec![shape("response", At::new("no response"))],
                 };
                 if problems.is_empty() {
                     outcome.matched += 1;
                 } else {
-                    let failure = mismatch(&req, problems);
+                    let failure = mismatch(&req, problems, opts.show_paths);
                     record(&outcome, &failure, &req)?;
                     if let Some(progress) = opts.progress {
                         progress(Event::Mismatch(&failure));
@@ -420,9 +442,9 @@ pub fn shadow(opts: &ShadowOptions) -> Result<ShadowOutcome> {
             p.problems.push("never answered by the build".to_string());
         }
         for (why, n) in &p.fallbacks {
-            let by_design = allowed
-                .iter()
-                .any(|(r, allowed)| r.key() == route.key() && allowed == why);
+            let by_design = allowed.iter().any(|(r, allowed)| {
+                allowed == why && r.as_ref().is_none_or(|r| r.key() == route.key())
+            });
             if !by_design {
                 p.problems.push(format!("fell back {n}× ({why})"));
             }
@@ -432,8 +454,12 @@ pub fn shadow(opts: &ShadowOptions) -> Result<ShadowOutcome> {
     Ok(outcome)
 }
 
-fn mismatch(req: &Req, problems: Vec<Problem>) -> Failure {
-    let path = hash(&req.path);
+fn mismatch(req: &Req, problems: Vec<Problem>, show_paths: bool) -> Failure {
+    let path = if show_paths {
+        req.path.clone()
+    } else {
+        hash(&req.path)
+    };
     Failure {
         case: format!("{} {path}", req.method),
         args: vec![req.method.clone(), path],
@@ -503,9 +529,9 @@ mod tests {
             ],
             "at 2025-06-07T08:09:10Z: secret\n",
         );
-        assert!(compare(&norm, &none, &a, &same).is_empty());
+        assert!(compare(&norm, &none, &none, &a, &same).is_empty());
         let other = resp(500, &[("x-at", "2025-06-07T08:09:10Z")], "at 2025: oops\n");
-        let problems = compare(&norm, &none, &a, &other);
+        let problems = compare(&norm, &none, &none, &a, &other);
         assert_eq!(fields(&problems), ["status", "header content-type", "body"]);
         let text = format!("{problems:?}");
         assert!(!text.contains("secret") && !text.contains("oops"), "{text}");
@@ -521,12 +547,37 @@ mod tests {
     fn a_header_the_original_varied_on_is_checked_for_presence_only() {
         let norm = Normalizers::new(&config(&[])).unwrap();
         let noisy: BTreeSet<String> = ["set-cookie".to_string()].into();
+        let none = BTreeSet::new();
         let a = resp(200, &[("set-cookie", "id=1")], "");
-        assert!(compare(&norm, &noisy, &a, &resp(200, &[("set-cookie", "id=2")], "")).is_empty());
+        assert!(
+            compare(
+                &norm,
+                &noisy,
+                &none,
+                &a,
+                &resp(200, &[("set-cookie", "id=2")], "")
+            )
+            .is_empty()
+        );
         assert_eq!(
-            fields(&compare(&norm, &noisy, &a, &resp(200, &[], ""))),
+            fields(&compare(&norm, &noisy, &none, &a, &resp(200, &[], ""))),
             ["header set-cookie"]
         );
+    }
+
+    #[test]
+    fn an_ignored_header_is_not_compared_even_when_missing() {
+        let norm = Normalizers::new(&config(&[])).unwrap();
+        let none = BTreeSet::new();
+        let ignored: BTreeSet<String> = ["x-request-id".to_string()].into();
+        let a = resp(200, &[("x-request-id", "a1")], "");
+        let b = resp(200, &[("x-request-id", "b2")], "");
+        assert_eq!(
+            fields(&compare(&norm, &none, &none, &a, &b)),
+            ["header x-request-id"]
+        );
+        assert!(compare(&norm, &none, &ignored, &a, &b).is_empty());
+        assert!(compare(&norm, &none, &ignored, &a, &resp(200, &[], "")).is_empty());
     }
 
     #[test]
@@ -553,6 +604,11 @@ mod tests {
         assert_eq!(reason("POST /x Temporary:task-12"), "Temporary:task-12");
         assert_eq!(reason("GET /plain"), "unnamed");
         assert_eq!(reason("GET /plain "), "unnamed");
+        assert_eq!(
+            reason("GET /me Identity req-7f3a user was signed out"),
+            "Identity"
+        );
+        assert_eq!(reason("GET /me  Identity"), "Identity");
     }
 
     #[test]
@@ -565,10 +621,11 @@ mod tests {
             body_base64: None,
             body_file: None,
         };
-        let failure = mismatch(&req, Vec::new());
+        let failure = mismatch(&req, Vec::new(), false);
         assert_eq!(failure.case, format!("GET {}", hash("/users/alice")));
         assert_eq!(failure.case.len(), "GET ".len() + 16);
         assert!(!format!("{failure:?}").contains("alice"));
         assert_ne!(hash("/users/alice"), hash("/users/bob"));
+        assert_eq!(mismatch(&req, Vec::new(), true).case, "GET /users/alice");
     }
 }
