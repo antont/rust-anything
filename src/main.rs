@@ -692,6 +692,19 @@ enum AppCmd {
         /// Stop after this many requests (for tests and CI); runs until Ctrl-C otherwise.
         #[arg(long, value_name = "N")]
         requests: Option<usize>,
+        /// Stop once no request has come for this many seconds, counted from the first one: for a
+        /// test suite as the client.
+        #[arg(long, value_name = "SECS")]
+        idle: Option<u64>,
+        /// A route the build must answer itself (`GET /users/{id}`, as `app wire --route` takes
+        /// it); repeatable. The run fails if a request fell back on it, or none reached the build
+        /// on it. A fallback names its reason after `METHOD path` in `RUST_ANYTHING_FALLBACK_LOG`.
+        #[arg(long, value_name = "ROUTE")]
+        ported: Vec<String>,
+        /// A fallback a `--ported` route makes by design, as `ROUTE=REASON` (`GET /me=Identity`);
+        /// repeatable.
+        #[arg(long, value_name = "ROUTE=REASON")]
+        allow_fallback: Vec<String>,
         /// Seconds to wait for each answer (default: the one saved by `app record`, 30 seconds
         /// unless it was changed).
         #[arg(long)]
@@ -1937,6 +1950,9 @@ fn run_app(command: AppCmd) -> Result<ExitCode> {
             listen,
             upstream,
             requests,
+            idle,
+            ported,
+            allow_fallback,
             timeout,
             keep,
             json,
@@ -1968,12 +1984,46 @@ fn run_app(command: AppCmd) -> Result<ExitCode> {
                 requests,
                 timeout_secs: timeout,
                 keep,
+                ported: &ported,
+                allow_fallback: &allow_fallback,
+                idle_secs: idle,
                 progress: Some(&progress),
             })?;
             if json {
                 say!("{}", serde_json::to_string_pretty(&outcome)?);
             } else {
-                say!("{}/{} requests matched", outcome.matched, outcome.requests);
+                match outcome.fallbacks {
+                    Some(fallbacks) => {
+                        say!(
+                            "{}/{} requests the build answered matched",
+                            outcome.matched,
+                            outcome.requests - fallbacks
+                        );
+                        say!(
+                            "Fallback rate: {:.1}% ({}/{})",
+                            fallbacks as f64 * 100.0 / outcome.requests.max(1) as f64,
+                            fallbacks,
+                            outcome.requests
+                        );
+                    }
+                    None => say!("{}/{} requests matched", outcome.matched, outcome.requests),
+                }
+                if !outcome.reasons.is_empty() {
+                    let reasons: Vec<String> = outcome
+                        .reasons
+                        .iter()
+                        .map(|(why, n)| format!("{why} {n}"))
+                        .collect();
+                    say!("Fallback reasons: {}", reasons.join(", "));
+                }
+                for p in &outcome.ported {
+                    let verdict = if p.problems.is_empty() {
+                        "ok".to_string()
+                    } else {
+                        p.problems.join("; ")
+                    };
+                    say!("  {}: answered {}, {verdict}", p.route, p.answered);
+                }
                 say_groups(&outcome.groups);
                 if !outcome.mismatches.is_empty() {
                     say!("Log: {}", outcome.log.display());
@@ -1990,7 +2040,7 @@ fn run_app(command: AppCmd) -> Result<ExitCode> {
                     );
                 }
             }
-            if !outcome.mismatches.is_empty() {
+            if !outcome.mismatches.is_empty() || outcome.ported_failed() {
                 return Ok(ExitCode::FAILURE);
             }
         }

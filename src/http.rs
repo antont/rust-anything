@@ -660,6 +660,9 @@ impl Server {
             .stdin(Stdio::null())
             .stdout(std::fs::File::create(dir.join("stdout"))?)
             .stderr(std::fs::File::create(dir.join("stderr"))?);
+        if launch.shadow {
+            cmd.env(app::SHADOW_ENV, "1");
+        }
         let mut child = cmd
             .spawn()
             .with_context(|| format!("starting `{}`", command.join(" ")))?;
@@ -750,10 +753,16 @@ impl Server {
         }
     }
 
-    fn fallbacks(&self) -> Option<usize> {
+    pub(crate) fn fallbacks(&self) -> Option<usize> {
+        self.fallback_lines().map(|lines| lines.len())
+    }
+
+    /// The lines of the build's `RUST_ANYTHING_FALLBACK_LOG`, one per request it handed to the
+    /// original; `None` when the build never created it.
+    pub(crate) fn fallback_lines(&self) -> Option<Vec<String>> {
         std::fs::read_to_string(&self.log)
             .ok()
-            .map(|t| t.lines().count())
+            .map(|t| t.lines().map(str::to_string).collect())
     }
 
     fn stop(&mut self) {
@@ -971,6 +980,8 @@ pub(crate) struct Launch<'a> {
     pub(crate) ready: Duration,
     /// A request that must answer before the app counts as ready, e.g. `GET /health`.
     pub(crate) ready_request: Option<&'a str>,
+    /// A build run by `app shadow`: it gets `RUST_ANYTHING_SHADOW`.
+    pub(crate) shadow: bool,
 }
 
 /// Starts a server on an auto-picked ephemeral port, retrying if another process claims the port
@@ -1803,6 +1814,7 @@ pub(crate) fn record(
         effects: config.effects.as_ref(),
         ready: ready_timeout(&http),
         ready_request: http.ready_request.as_deref(),
+        shadow: false,
     };
     let one = run_all(&config.run, &launch, repo, fixed, &reqs, timeout)?;
     let two = run_all(&config.run, &launch, repo, fixed, &reqs, timeout)?;
@@ -2104,6 +2116,7 @@ pub(crate) fn replay(
         effects: config.effects.as_ref(),
         ready: ready_timeout(&http),
         ready_request: http.ready_request.as_deref(),
+        shadow: false,
     };
     let answers = run_all(command, &launch, repo, fixed_port, &reqs, timeout)?;
     let mut outcome = ReplayOutcome {
@@ -3227,6 +3240,7 @@ mod tests {
             effects: None,
             ready: Duration::from_secs(1),
             ready_request: None,
+            shadow: false,
         };
         let repo = std::env::temp_dir();
 

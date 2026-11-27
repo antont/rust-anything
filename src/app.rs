@@ -23,6 +23,9 @@ pub const CASES_DIR: &str = "rust/app-cases";
 pub const CONFIG_FILE: &str = "rust-anything.json";
 pub const REPORT_FILE: &str = "replay-report.md";
 pub const FALLBACK_ENV: &str = "RUST_ANYTHING_FALLBACK_LOG";
+/// Set for a build run by `app shadow`: the original has already answered the request, so a
+/// fallback is logged but not forwarded, or each write would run twice.
+pub const SHADOW_ENV: &str = "RUST_ANYTHING_SHADOW";
 pub const BUILTIN_NORMALIZERS: [&str; 3] = ["timestamps", "uuids", "key-order"];
 pub(crate) const SCHEMA: &str = "rust-anything/app-cases@1";
 pub(crate) const MAX_TRAPS: usize = 300;

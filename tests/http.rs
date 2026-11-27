@@ -2158,6 +2158,271 @@ fn ask(port: u16, raw: &str) -> String {
     }
 }
 
+/// An original that answers `GET /hello` and appends each `POST /add` to a shared file (the
+/// test puts its path in place of `process.env.WRITES`), as a shared database would.
+const WRITING_SERVER: &str = r#"const fs = require("node:fs");
+const http = require("node:http");
+http.createServer((req, res) => {
+  if (req.method === "POST" && req.url === "/add") fs.appendFileSync(process.env.WRITES, "add\n");
+  res.writeHead(200, { "content-type": "text/plain" });
+  res.end(req.url === "/hello" ? "hello" : "ok");
+}).listen(Number(process.env.PORT));
+"#;
+
+/// A strangler front door: it answers `GET /hello` itself and hands everything else to the
+/// original, logging each handover to `RUST_ANYTHING_FALLBACK_LOG`. Under
+/// `RUST_ANYTHING_SHADOW` it does not forward; otherwise it does what the original would.
+const STRANGLER: &str = r#"const fs = require("node:fs");
+const http = require("node:http");
+http.createServer((req, res) => {
+  if (req.method === "GET" && req.url === "/hello") {
+    res.writeHead(200, { "content-type": "text/plain" });
+    return res.end("hello");
+  }
+  fs.appendFileSync(process.env.RUST_ANYTHING_FALLBACK_LOG, req.method + " " + req.url + " Unported\n");
+  if (process.env.RUST_ANYTHING_SHADOW) {
+    res.writeHead(599);
+    return res.end();
+  }
+  if (req.method === "POST" && req.url === "/add") fs.appendFileSync(process.env.WRITES, "add\n");
+  res.writeHead(200, { "content-type": "text/plain" });
+  res.end("ok");
+}).listen(Number(process.env.PORT));
+"#;
+
+#[test]
+fn shadow_counts_what_a_strangler_hands_to_the_original_and_writes_once() {
+    // A front door that answers some routes and proxies the rest: what it proxied is not the
+    // port's answer, so it is a fallback, neither a match nor a mismatch; and under shadow it
+    // must not forward, or each write runs on shadow's original and on the build's own.
+    if !common::have_with("node", &["--version"], "was not found") {
+        return;
+    }
+    let repo = std::env::temp_dir().join(format!(
+        "rust-anything-http-strangler-{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&repo);
+    std::fs::create_dir_all(&repo).unwrap();
+    let writes = repo.join("writes.log");
+    let at = serde_json::to_string(&writes).unwrap();
+    std::fs::write(
+        repo.join("server.js"),
+        WRITING_SERVER.replace("process.env.WRITES", &at),
+    )
+    .unwrap();
+    std::fs::write(
+        repo.join("strangler.js"),
+        STRANGLER.replace("process.env.WRITES", &at),
+    )
+    .unwrap();
+    std::fs::write(
+        repo.join("inputs.jsonl"),
+        "{\"name\":\"hello\",\"path\":\"/hello\"}\n",
+    )
+    .unwrap();
+    let out = app::record(&RecordOptions {
+        repo: &repo,
+        run: &words("node server.js"),
+        inputs: Some(&repo.join("inputs.jsonl")),
+        normalize: &[],
+        name: None,
+        traps: false,
+        timeout_secs: None,
+        http: Some(true),
+        server_args: None,
+        fresh: None,
+        pace_ms: None,
+        port: None,
+        float_tolerance: None,
+        float_files: &[],
+        effects: None,
+        ready_secs: None,
+        ready_request: None,
+    })
+    .unwrap();
+    assert_eq!(out.cases, 1, "{out:?}");
+    std::fs::remove_file(&writes).ok();
+
+    let port = rust_anything::http::free_port().unwrap();
+    let shadow = {
+        let repo = repo.clone();
+        std::thread::spawn(move || {
+            rust_anything::app_shadow::shadow(&rust_anything::app_shadow::ShadowOptions {
+                repo: &repo,
+                build: "node strangler.js",
+                listen: Some(port),
+                upstream: None,
+                requests: Some(3),
+                timeout_secs: None,
+                keep: false,
+                ported: &[],
+                allow_fallback: &[],
+                idle_secs: None,
+                progress: None,
+            })
+            .unwrap()
+        })
+    };
+    let hello = ask(
+        port,
+        "GET /hello HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+    );
+    assert!(hello.contains("hello"), "{hello}");
+    for _ in 0..2 {
+        let add = ask(
+            port,
+            "POST /add HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+        );
+        assert!(
+            add.contains("ok"),
+            "the client gets the original's answer: {add}"
+        );
+    }
+    let outcome = shadow.join().unwrap();
+    let written = std::fs::read_to_string(&writes).unwrap_or_default();
+    let _ = std::fs::remove_dir_all(&repo);
+    assert_eq!(
+        (outcome.requests, outcome.matched, outcome.fallbacks),
+        (3, 1, Some(2)),
+        "{outcome:?}"
+    );
+    assert!(outcome.mismatches.is_empty(), "{outcome:?}");
+    assert_eq!(written.lines().count(), 2, "each write once: {written}");
+}
+
+/// Shadows `GET /hello` and two `POST /add` through the strangler until it is idle, with `ported`
+/// and `allowed` as `--ported` and `--allow-fallback`.
+fn shadow_strangler(ported: &[&str], allowed: &[&str]) -> rust_anything::app_shadow::ShadowOutcome {
+    let repo = std::env::temp_dir().join(format!(
+        "rust-anything-http-ported-{}-{}",
+        std::process::id(),
+        allowed.len()
+    ));
+    let _ = std::fs::remove_dir_all(&repo);
+    std::fs::create_dir_all(&repo).unwrap();
+    let at = serde_json::to_string(&repo.join("writes.log")).unwrap();
+    std::fs::write(
+        repo.join("server.js"),
+        WRITING_SERVER.replace("process.env.WRITES", &at),
+    )
+    .unwrap();
+    std::fs::write(
+        repo.join("strangler.js"),
+        STRANGLER.replace("process.env.WRITES", &at),
+    )
+    .unwrap();
+    std::fs::write(
+        repo.join("inputs.jsonl"),
+        "{\"name\":\"hello\",\"path\":\"/hello\"}\n",
+    )
+    .unwrap();
+    app::record(&RecordOptions {
+        repo: &repo,
+        run: &words("node server.js"),
+        inputs: Some(&repo.join("inputs.jsonl")),
+        normalize: &[],
+        name: None,
+        traps: false,
+        timeout_secs: None,
+        http: Some(true),
+        server_args: None,
+        fresh: None,
+        pace_ms: None,
+        port: None,
+        float_tolerance: None,
+        float_files: &[],
+        effects: None,
+        ready_secs: None,
+        ready_request: None,
+    })
+    .unwrap();
+    let port = rust_anything::http::free_port().unwrap();
+    let ported: Vec<String> = ported.iter().map(|r| r.to_string()).collect();
+    let allowed: Vec<String> = allowed.iter().map(|r| r.to_string()).collect();
+    let shadow = {
+        let repo = repo.clone();
+        std::thread::spawn(move || {
+            rust_anything::app_shadow::shadow(&rust_anything::app_shadow::ShadowOptions {
+                repo: &repo,
+                build: "node strangler.js",
+                listen: Some(port),
+                upstream: None,
+                requests: None,
+                timeout_secs: None,
+                keep: false,
+                ported: &ported,
+                allow_fallback: &allowed,
+                idle_secs: Some(1),
+                progress: None,
+            })
+            .unwrap()
+        })
+    };
+    ask(
+        port,
+        "GET /hello HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+    );
+    for _ in 0..2 {
+        ask(
+            port,
+            "POST /add HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+        );
+    }
+    let outcome = shadow.join().unwrap();
+    let _ = std::fs::remove_dir_all(&repo);
+    outcome
+}
+
+#[test]
+fn shadow_fails_a_ported_route_that_fell_back_or_was_never_answered() {
+    // A port that silently proxies a route it claims, or never sees it, must not pass: the
+    // audit needs the build to have answered each ported route, and a handover on one to be
+    // allowed by name.
+    if !common::have_with("node", &["--version"], "was not found") {
+        return;
+    }
+    let ported = ["GET /hello", "POST /add", "GET /users/{id}"];
+    let outcome = shadow_strangler(&ported, &[]);
+    assert_eq!(outcome.requests, 3, "--idle ends the run: {outcome:?}");
+    assert_eq!(outcome.reasons.get("Unported"), Some(&2), "{outcome:?}");
+    let verdicts: Vec<(&str, usize, Vec<&str>)> = outcome
+        .ported
+        .iter()
+        .map(|p| {
+            (
+                p.route.as_str(),
+                p.answered,
+                p.problems.iter().map(String::as_str).collect(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        verdicts,
+        [
+            ("GET /hello", 1, vec![]),
+            (
+                "POST /add",
+                0,
+                vec!["never answered by the build", "fell back 2× (Unported)"]
+            ),
+            ("GET /users/{id}", 0, vec!["never answered by the build"]),
+        ]
+    );
+    assert!(outcome.ported_failed());
+
+    let allowed = shadow_strangler(&["GET /hello", "POST /add"], &["POST /add=Unported"]);
+    let problems: Vec<&Vec<String>> = allowed.ported.iter().map(|p| &p.problems).collect();
+    assert_eq!(
+        problems,
+        [
+            &Vec::<String>::new(),
+            &vec!["never answered by the build".to_string()]
+        ],
+        "an allowed fallback is not a failure, but the route was still never answered"
+    );
+}
+
 #[test]
 fn shadow_answers_with_the_original_and_logs_the_build_mismatch_as_a_shape() {
     if !common::have_with("node", &["--version"], "was not found") {
@@ -2184,6 +2449,9 @@ fn shadow_answers_with_the_original_and_logs_the_build_mismatch_as_a_shape() {
                 requests: Some(3),
                 timeout_secs: None,
                 keep: true,
+                ported: &[],
+                allow_fallback: &[],
+                idle_secs: None,
                 progress: None,
             })
             .unwrap()

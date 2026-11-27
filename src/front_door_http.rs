@@ -57,6 +57,34 @@ impl Route {
     fn has_params(&self) -> bool {
         self.path.contains('{')
     }
+
+    /// Whether a request for `method` and `target` (query left out) is this route's: a literal
+    /// segment must be equal, `{name}` takes one non-empty segment, `{*rest}` the rest.
+    pub fn matches(&self, method: &str, target: &str) -> bool {
+        if self
+            .method
+            .as_deref()
+            .is_some_and(|m| !m.eq_ignore_ascii_case(method))
+        {
+            return false;
+        }
+        if self.path == "*" {
+            return true;
+        }
+        let path = target.split(['?', '#']).next().unwrap_or("");
+        let mut segments = path.trim_start_matches('/').split('/');
+        for part in self.path.trim_start_matches('/').split('/') {
+            if part.starts_with("{*") {
+                return true;
+            }
+            match segments.next() {
+                Some(s) if part.starts_with('{') && !s.is_empty() => {}
+                Some(s) if s == part => {}
+                _ => return false,
+            }
+        }
+        segments.next().is_none()
+    }
 }
 
 /// Rejects routes another unit already answers, and a path both for any method and for one.
@@ -236,6 +264,8 @@ const ROOT: &str = match option_env!(\"RUST_ANYTHING_REPO\") {{
 }};
 const RUN: &[&str] = &[{words}];
 const FALLBACK_LOG: &str = \"{log}\";
+/// Set by `rust-anything app shadow`, whose own original has already answered the request.
+const SHADOW: &str = \"{shadow}\";
 const READY: Option<&str> = {ready};
 
 fn resolve(word: &str, port: u16) -> OsString {{
@@ -285,6 +315,7 @@ impl Original {{
             .args(std::env::args_os().skip(1))
             {cwd}.env(\"PORT\", port.to_string())
             .env_remove(FALLBACK_LOG)
+            .env_remove(SHADOW)
             .stdin(Stdio::null())
             .spawn()
             .expect(\"starting the original\");
@@ -367,6 +398,12 @@ pub async fn proxy(State(original): State<Original>, req: Request) -> Response {
     if let Some(mut file) = log() {{
         let _ = writeln!(file, \"{{}} {{target}}\", parts.method);
     }}
+    if std::env::var_os(SHADOW).is_some() {{
+        // Forwarding would run the request's writes a second time, on this copy of the original.
+        return StatusCode::from_u16(599)
+            .unwrap_or(StatusCode::BAD_GATEWAY)
+            .into_response();
+    }}
     let Ok(body) = axum::body::to_bytes(body, usize::MAX).await else {{
         return (StatusCode::BAD_REQUEST, \"front door: unreadable request body\").into_response();
     }};
@@ -401,7 +438,8 @@ pub async fn proxy(State(original): State<Original>, req: Request) -> Response {
 }}
 {SHUTDOWN}",
         words = words.join(", "),
-        log = app::FALLBACK_ENV
+        log = app::FALLBACK_ENV,
+        shadow = app::SHADOW_ENV
     )
 }
 
@@ -648,6 +686,41 @@ mod tests {
             plain.contains("const READY: Option<&str> = None;"),
             "{plain}"
         );
+    }
+
+    #[test]
+    fn under_shadow_a_fallback_is_logged_but_not_forwarded() {
+        // `app shadow`'s own original has answered already: forwarding would write twice.
+        let code = original_rs(
+            &["node".to_string(), "server.js".to_string()],
+            true,
+            60,
+            None,
+        );
+        let proxy = &code[code.find("pub async fn proxy").unwrap()..];
+        let logged = proxy.find("writeln!(file").unwrap();
+        let declined = proxy.find("std::env::var_os(SHADOW).is_some()").unwrap();
+        let forwarded = proxy.find(".request(parts.method").unwrap();
+        assert!(logged < declined && declined < forwarded, "{proxy}");
+        assert!(
+            code.contains("const SHADOW: &str = \"RUST_ANYTHING_SHADOW\";"),
+            "{code}"
+        );
+        assert!(code.contains(".env_remove(SHADOW)"), "{code}");
+    }
+
+    #[test]
+    fn a_route_matches_requests_as_axum_routes_them() {
+        let user = Route::parse("GET /users/{id}").unwrap();
+        assert!(user.matches("GET", "/users/42"));
+        assert!(user.matches("get", "/users/42?full=1"));
+        assert!(!user.matches("POST", "/users/42"));
+        assert!(!user.matches("GET", "/users/"));
+        assert!(!user.matches("GET", "/users/42/posts"));
+        let files = Route::parse("/files/{*rest}").unwrap();
+        assert!(files.matches("PUT", "/files/a/b/c"));
+        assert!(!files.matches("PUT", "/other/a"));
+        assert!(Route::parse("*").unwrap().matches("DELETE", "/anything"));
     }
 
     #[test]

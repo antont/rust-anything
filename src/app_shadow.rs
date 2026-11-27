@@ -1,19 +1,22 @@
 //! `app shadow`: a proxy in front of a server and a build. Every request is answered by the
 //! original; the build gets the same request afterwards and its answer is compared. The build's
 //! outbound HTTP and mail go to local sinks and its files to a fresh copy, so no side effect
-//! happens twice. Mismatches are logged as shapes, never values.
+//! happens twice. A request the build hands to the original (a line in its
+//! `RUST_ANYTHING_FALLBACK_LOG`) is a fallback: counted, not compared. Mismatches are logged as
+//! shapes, never values.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::Write;
 use std::net::{SocketAddr, TcpListener, ToSocketAddrs};
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail, ensure};
 use serde::Serialize;
 
 use crate::app::{self, Config, Failure, Normalizers, Problem};
 use crate::effects::EffectsConfig;
+use crate::front_door_http::Route;
 use crate::http::{self, Launch, Req, Resp, Server};
 use crate::mismatch::{At, Group, text_at};
 use crate::walk::Canonical;
@@ -28,6 +31,8 @@ pub enum Event<'a> {
     Listening(SocketAddr),
     /// The build answered a request differently.
     Mismatch(&'a Failure),
+    /// The build handed the request to the original instead of answering it.
+    Fallback(&'a Req),
 }
 
 pub struct ShadowOptions<'a> {
@@ -44,13 +49,31 @@ pub struct ShadowOptions<'a> {
     pub timeout_secs: Option<u64>,
     /// Append each mismatching request to `shadow/inputs.jsonl`.
     pub keep: bool,
+    /// Routes the build must answer itself (`GET /users/{id}`): one that a request fell back on,
+    /// or that no request reached the build on, fails the run.
+    pub ported: &'a [String],
+    /// Fallbacks a ported route may make by design, as `ROUTE=REASON` (`GET /me=Identity`).
+    pub allow_fallback: &'a [String],
+    /// Stop when no request came for this many seconds after the first one.
+    pub idle_secs: Option<u64>,
     pub progress: Option<&'a dyn Fn(Event)>,
 }
 
 #[derive(Debug, Serialize)]
 pub struct ShadowOutcome {
     pub requests: usize,
+    /// Requests the build answered itself, as the original did.
     pub matched: usize,
+    /// Requests the build handed to the original, from its `RUST_ANYTHING_FALLBACK_LOG`; `None`
+    /// for a build that does not count its fallbacks.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fallbacks: Option<usize>,
+    /// Fallbacks by the reason the build wrote after `METHOD path` (`unnamed` for none).
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub reasons: BTreeMap<String, usize>,
+    /// Each `--ported` route: how often the build answered it and fell back on it.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub ported: Vec<Ported>,
     /// One per mismatching request, as shapes: the path is hashed and no value is kept.
     pub mismatches: Vec<Failure>,
     /// The distinct differences among the mismatches, most requests first.
@@ -60,6 +83,37 @@ pub struct ShadowOutcome {
     /// The kept requests (`--keep`), in `app record --inputs` format.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub inputs: Option<PathBuf>,
+}
+
+/// A route the build must answer itself, and what the shadowed requests did on it.
+#[derive(Debug, Serialize)]
+pub struct Ported {
+    pub route: String,
+    /// Requests on the route the build answered itself, matching or not.
+    pub answered: usize,
+    /// Fallbacks on the route, by reason.
+    pub fallbacks: BTreeMap<String, usize>,
+    /// Why the route fails the run: never answered, or fallbacks no `--allow-fallback` names.
+    pub problems: Vec<String>,
+}
+
+impl ShadowOutcome {
+    /// Whether any `--ported` route failed.
+    pub fn ported_failed(&self) -> bool {
+        self.ported.iter().any(|p| !p.problems.is_empty())
+    }
+}
+
+/// The reason on a fallback line, `METHOD path [reason]`.
+fn reason(line: &str) -> String {
+    let mut fields = line.splitn(3, ' ');
+    let _ = (fields.next(), fields.next());
+    fields
+        .next()
+        .map(str::trim)
+        .filter(|r| !r.is_empty())
+        .unwrap_or("unnamed")
+        .to_string()
 }
 
 /// FNV-1a, 64 bits, as hex.
@@ -174,6 +228,26 @@ pub fn shadow(opts: &ShadowOptions) -> Result<ShadowOutcome> {
             dir.display()
         );
     };
+    let ported: Vec<Route> = opts
+        .ported
+        .iter()
+        .map(|r| Route::parse(r))
+        .collect::<Result<_>>()
+        .context("--ported")?;
+    let allowed: Vec<(Route, String)> = opts
+        .allow_fallback
+        .iter()
+        .map(|a| -> Result<(Route, String)> {
+            let (route, reason) = a.rsplit_once('=').with_context(|| {
+                format!("--allow-fallback `{a}`: give ROUTE=REASON, e.g. `GET /me=Identity`")
+            })?;
+            Ok((Route::parse(route)?, reason.trim().to_string()))
+        })
+        .collect::<Result<_>>()?;
+    ensure!(
+        opts.idle_secs != Some(0),
+        "--idle must be at least 1 second"
+    );
     let command = app::shell_split(opts.build)?;
     ensure!(!command.is_empty(), "the build command is empty");
     let norm = Normalizers::new(&config)?;
@@ -199,6 +273,7 @@ pub fn shadow(opts: &ShadowOptions) -> Result<ShadowOutcome> {
                 effects: None,
                 ready,
                 ready_request: http_config.ready_request.as_deref(),
+                shadow: false,
             };
             let server = match http_config.port {
                 Some(port) => Server::start(&config.run, &launch, &repo, port),
@@ -220,6 +295,7 @@ pub fn shadow(opts: &ShadowOptions) -> Result<ShadowOutcome> {
         effects: Some(&sinks),
         ready,
         ready_request: http_config.ready_request.as_deref(),
+        shadow: true,
     };
     let build = http::start_ephemeral(&command, &launch, &repo, http::free_port)
         .context("starting the build")?;
@@ -230,6 +306,17 @@ pub fn shadow(opts: &ShadowOptions) -> Result<ShadowOutcome> {
     let mut outcome = ShadowOutcome {
         requests: 0,
         matched: 0,
+        fallbacks: None,
+        reasons: BTreeMap::new(),
+        ported: ported
+            .iter()
+            .map(|r| Ported {
+                route: r.key(),
+                answered: 0,
+                fallbacks: BTreeMap::new(),
+                problems: Vec::new(),
+            })
+            .collect(),
         mismatches: Vec::new(),
         groups: Vec::new(),
         log: shadow_dir.join(MISMATCHES_FILE),
@@ -238,10 +325,24 @@ pub fn shadow(opts: &ShadowOptions) -> Result<ShadowOutcome> {
     if let Some(progress) = opts.progress {
         progress(Event::Listening(listener.local_addr()?));
     }
-    for client in listener.incoming() {
-        let Ok(mut client) = client else {
-            continue;
+    if opts.idle_secs.is_some() {
+        listener.set_nonblocking(true)?;
+    }
+    let mut last: Option<Instant> = None;
+    loop {
+        let mut client = match listener.accept() {
+            Ok((client, _)) => client,
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                let idle = Duration::from_secs(opts.idle_secs.unwrap_or(0));
+                if last.is_some_and(|t| t.elapsed() >= idle) {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(20));
+                continue;
+            }
+            Err(_) => continue,
         };
+        client.set_nonblocking(false)?;
         client.set_read_timeout(Some(timeout))?;
         client.set_write_timeout(Some(timeout))?;
         let Ok(req) = http::read_request(&mut client) else {
@@ -260,11 +361,42 @@ pub fn shadow(opts: &ShadowOptions) -> Result<ShadowOutcome> {
             Ok((answer, raw)) => {
                 let _ = client.write_all(&raw);
                 drop(client);
-                let problems = match http::exchange(build.addr, &req, timeout) {
+                let before = build.fallbacks().unwrap_or(0);
+                let built = http::exchange(build.addr, &req, timeout);
+                let lines = build.fallback_lines();
+                build.drain_effects(&repo);
+                last = Some(Instant::now());
+                // A build that creates its log counts its fallbacks, even when it makes none.
+                if lines.is_some() {
+                    outcome.fallbacks.get_or_insert(0);
+                }
+                let route = ported
+                    .iter()
+                    .position(|r| r.matches(&req.method, &req.path));
+                let new: Vec<String> = lines.unwrap_or_default().into_iter().skip(before).collect();
+                // A handover is not the port's answer: whatever came back is not compared.
+                if let Some(line) = new.last() {
+                    let why = reason(line);
+                    *outcome.fallbacks.get_or_insert(0) += 1;
+                    *outcome.reasons.entry(why.clone()).or_default() += 1;
+                    if let Some(i) = route {
+                        *outcome.ported[i].fallbacks.entry(why).or_default() += 1;
+                    }
+                    if let Some(progress) = opts.progress {
+                        progress(Event::Fallback(&req));
+                    }
+                    if opts.requests.is_some_and(|n| outcome.requests >= n) {
+                        break;
+                    }
+                    continue;
+                }
+                if let Some(i) = route {
+                    outcome.ported[i].answered += 1;
+                }
+                let problems = match built {
                     Ok((built, _)) => compare(&norm, &noisy, &answer, &built),
                     Err(_) => vec![shape("response", At::new("no response"))],
                 };
-                build.drain_effects(&repo);
                 if problems.is_empty() {
                     outcome.matched += 1;
                 } else {
@@ -283,6 +415,19 @@ pub fn shadow(opts: &ShadowOptions) -> Result<ShadowOutcome> {
     }
     drop(build);
     let _ = std::fs::remove_dir_all(&scratch);
+    for (p, route) in outcome.ported.iter_mut().zip(&ported) {
+        if p.answered == 0 {
+            p.problems.push("never answered by the build".to_string());
+        }
+        for (why, n) in &p.fallbacks {
+            let by_design = allowed
+                .iter()
+                .any(|(r, allowed)| r.key() == route.key() && allowed == why);
+            if !by_design {
+                p.problems.push(format!("fell back {n}× ({why})"));
+            }
+        }
+    }
     outcome.groups = crate::mismatch::replay_groups(&outcome.mismatches);
     Ok(outcome)
 }
@@ -400,6 +545,14 @@ mod tests {
         assert!(sinks.db_reset.is_none() && sinks.db_dump.is_none());
         let fresh = sinks_for(None);
         assert!(fresh.http && fresh.smtp && fresh.smtp_parts);
+    }
+
+    #[test]
+    fn a_fallback_line_names_its_reason_after_method_and_path() {
+        assert_eq!(reason("GET /me Identity"), "Identity");
+        assert_eq!(reason("POST /x Temporary:task-12"), "Temporary:task-12");
+        assert_eq!(reason("GET /plain"), "unnamed");
+        assert_eq!(reason("GET /plain "), "unnamed");
     }
 
     #[test]

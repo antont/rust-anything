@@ -720,6 +720,9 @@ fn shadow_lets_the_original_mail_once_and_sends_the_build_mail_to_a_sink() {
                 requests: Some(1),
                 timeout_secs: None,
                 keep: false,
+                ported: &[],
+                allow_fallback: &[],
+                idle_secs: None,
                 progress: None,
             })
         })

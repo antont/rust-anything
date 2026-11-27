@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+- `app shadow` counts a request the build hands to the original (a line in its
+  `RUST_ANYTHING_FALLBACK_LOG`) as a fallback instead of comparing it, and reports a fallback rate
+  next to how many of the requests the build answered matched. Before, a front door that ported
+  nothing yet showed `4/4 requests matched`, comparing one copy of the original with another. The
+  build gets `RUST_ANYTHING_SHADOW=1`, and a generated front door then logs the fallback without
+  forwarding it, so a write is no longer run twice, by shadow's original and by the front door's
+  own copy. A fallback line may name its reason (`GET /me Identity`), counted by reason;
+  `--ported ROUTE` fails the run when a route the build must answer fell back or was never
+  answered, `--allow-fallback ROUTE=REASON` allows a fallback by design, and `--idle SECS` ends
+  the run once requests stop, for a test suite as the client.
 - A napi export called without an optional structured argument, such as an array, now gets
   `None` on the JSON path that async calls always take, instead of failing with
   `invalid type: map, expected a sequence` before the port runs. A `serde_json::Value` parameter

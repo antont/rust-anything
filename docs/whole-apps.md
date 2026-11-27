@@ -226,6 +226,22 @@ rust-anything app shadow . --build ./server-rs --upstream 127.0.0.1:3000 --keep
   reaches over the network is not isolated: point the build at a copy.
 - A header whose value differed between the original's own runs when it was recorded is checked
   for presence only.
+- A front door that answers some routes and hands the rest to the original (`app front-door`
+  before every route is wired) is shadowed for what it ported. A request during which the build
+  appends a line to its `RUST_ANYTHING_FALLBACK_LOG` is a fallback: not compared, and counted in a
+  fallback rate next to how many of the requests the build answered matched. The build also gets
+  `RUST_ANYTHING_SHADOW=1`; the generated front door then logs the fallback but does not forward
+  it (it answers 599), so a write runs once, on the original that answered the client. A front
+  door generated before this keeps forwarding: add the same check to its `proxy`, or generate it
+  again.
+- A fallback line can name its reason after the path (`GET /me Identity`); the summary counts
+  fallbacks by reason. `--ported 'GET /users/{id}'` (repeatable, the syntax of
+  `app wire --route`) names a route the build must answer itself: the run fails if a request fell
+  back on it, or if no request reached the build on it, so a port that proxies everything cannot
+  pass. `--allow-fallback 'GET /me=Identity'` lets a ported route fall back for one reason by
+  design (a signed-out caller left to the original).
+- `--idle 5` stops once no request has come for 5 seconds after the first one, for a test suite
+  as the client: point it at `--listen`, run it, and shadow ends with its summary.
 - Each mismatch is a line in `rust/app-cases/shadow/mismatches.jsonl` with the method, a hash of
   the path and, for each field that differed (`body`, `status`, `header content-type`), its
   shape as `app replay --redact` writes it: where it first differs, kind, line and column,
