@@ -14,7 +14,10 @@ use oxc_ast::ast::{
 use oxc_ast_visit::{Visit, walk};
 use oxc_parser::Parser;
 use oxc_span::{SourceType, Span};
-use oxc_syntax::{operator::UnaryOperator, scope::ScopeFlags};
+use oxc_syntax::{
+    operator::{BinaryOperator, UnaryOperator},
+    scope::ScopeFlags,
+};
 use serde::Serialize;
 
 use crate::risks::{Risk, regex_folds_differently, regex_needs_fancy};
@@ -222,12 +225,57 @@ fn string_arg(arg: Option<&Argument>) -> Option<String> {
     }
 }
 
-fn is_number_literal(arg: Option<&Argument>) -> bool {
-    match arg {
-        Some(Argument::NumericLiteral(_)) => true,
-        Some(Argument::UnaryExpression(u)) => {
-            u.operator == UnaryOperator::UnaryNegation
-                && matches!(u.argument, Expression::NumericLiteral(_))
+/// An argument that is a number without looking at any value: a numeric literal, `-1`,
+/// `+s`, `Date.UTC(..)`, `Date.now()`, `d.getTime()`, `d.valueOf()` or arithmetic on them.
+fn is_numeric_arg(arg: Option<&Argument>) -> bool {
+    arg.and_then(Argument::as_expression)
+        .is_some_and(is_numeric)
+}
+
+fn is_numeric(expr: &Expression<'_>) -> bool {
+    match expr.without_parentheses() {
+        Expression::NumericLiteral(_) => true,
+        Expression::UnaryExpression(u) => matches!(
+            u.operator,
+            UnaryOperator::UnaryNegation | UnaryOperator::UnaryPlus
+        ),
+        // `+` adds only when both sides are numbers; otherwise it may join strings.
+        Expression::BinaryExpression(b) if b.operator == BinaryOperator::Addition => {
+            is_numeric(&b.left) && is_numeric(&b.right)
+        }
+        Expression::BinaryExpression(b) => matches!(
+            b.operator,
+            BinaryOperator::Subtraction
+                | BinaryOperator::Multiplication
+                | BinaryOperator::Division
+                | BinaryOperator::Remainder
+                | BinaryOperator::Exponential
+        ),
+        Expression::CallExpression(call) => match &call.callee {
+            Expression::StaticMemberExpression(m) => {
+                match (identifier(&m.object), m.property.name.as_str()) {
+                    (Some("Date"), "UTC" | "now") => true,
+                    (_, "getTime" | "valueOf") => call.arguments.is_empty(),
+                    _ => false,
+                }
+            }
+            _ => false,
+        },
+        _ => false,
+    }
+}
+
+fn is_undefined(arg: Option<&Argument>) -> bool {
+    matches!(arg, Some(Argument::Identifier(id)) if id.name == "undefined")
+}
+
+/// `path`, `path.posix` or `path.win32` as the receiver of a call.
+fn is_path_module(expr: &Expression<'_>) -> bool {
+    match expr {
+        Expression::Identifier(id) => id.name == "path",
+        Expression::StaticMemberExpression(m) => {
+            identifier(&m.object) == Some("path")
+                && matches!(m.property.name.as_str(), "posix" | "win32")
         }
         _ => false,
     }
@@ -302,11 +350,14 @@ impl<'a> Visit<'a> for Collector {
                     ) => {
                         self.add(Risk::Intl, it.span);
                     }
-                    // `s.normalize("NFC")` or `s.normalize()`, not `path.normalize(p)`.
+                    // `s.normalize("NFC")`, `s.normalize()` or `s.normalize(undefined)`, not
+                    // `path.normalize(p)`, even when `p` is a literal that starts with "NF".
                     (_, "normalize")
-                        if it.arguments.is_empty()
-                            || string_arg(it.arguments.first())
-                                .is_some_and(|f| f.starts_with("NF")) =>
+                        if !is_path_module(&member.object)
+                            && (it.arguments.is_empty()
+                                || is_undefined(it.arguments.first())
+                                || string_arg(it.arguments.first())
+                                    .is_some_and(|f| f.starts_with("NF"))) =>
                     {
                         self.add(Risk::Intl, it.span);
                     }
@@ -344,8 +395,8 @@ impl<'a> Visit<'a> for Collector {
             }
             Some("Map" | "Set") => self.add(Risk::OrderedCollections, it.span),
             Some("Date") if it.arguments.is_empty() => self.add(Risk::ClockAndRandom, it.span),
-            // One argument that is not a number literal: a string the engine parses.
-            Some("Date") if it.arguments.len() == 1 && !is_number_literal(it.arguments.first()) => {
+            // One argument that is not known to be a number: a string the engine parses.
+            Some("Date") if it.arguments.len() == 1 && !is_numeric_arg(it.arguments.first()) => {
                 self.add(Risk::DateParsing, it.span);
             }
             Some("URL" | "URLSearchParams" | "TextEncoder" | "TextDecoder") => {
@@ -552,10 +603,20 @@ mod tests {
              export const t = (b: Uint8Array) => new TextDecoder().decode(b)\n\
              export const price = (n: number) => n.toLocaleString('de-DE')\n\
              export const day = (d: Date) => d.toLocaleDateString('en-US')\n\
-             export const hour = (d: Date) => d.toLocaleTimeString()\n",
+             export const hour = (d: Date) => d.toLocaleTimeString()\n\
+             export const nfs = () => path.normalize('NFS/../data')\n\
+             export const posix = () => path.posix.normalize('NFC/x')\n\
+             export const nfc2 = (s: string) => s.normalize(undefined)\n\
+             export const utc = () => new Date(Date.UTC(2026, 0, 1))\n\
+             export const now = () => new Date(Date.now())\n\
+             export const copy = (d: Date) => new Date(d.getTime())\n\
+             export const later = (d: Date) => new Date(d.valueOf() + 1)\n\
+             export const ago = (n: number) => new Date(Date.now() - n * 1000)\n\
+             export const unary = (s: string) => new Date(+s)\n\
+             export const glued = (s: string) => new Date(s + 'Z')\n",
         );
-        assert_eq!(facts.risks[&Risk::Intl], [1, 2, 3, 13, 14, 15]);
-        assert_eq!(facts.risks[&Risk::DateParsing], [6, 7]);
+        assert_eq!(facts.risks[&Risk::Intl], [1, 2, 3, 13, 14, 15, 18]);
+        assert_eq!(facts.risks[&Risk::DateParsing], [6, 7, 25]);
         assert_eq!(facts.risks[&Risk::WebApis], [10, 11, 12]);
     }
 

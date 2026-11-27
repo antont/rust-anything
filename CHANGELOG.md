@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- `analyze` no longer flags `new Date(...)` of a number it can see is one (`Date.UTC(..)`,
+  `Date.now()`, `d.getTime()`, `d.valueOf()`, `+s`, `-n`, or arithmetic on them) as `Date parsing`,
+  nor `path.normalize("NFS/..")` as `Intl`; `s.normalize(undefined)` now counts as `Intl` like
+  `s.normalize()` (follow-up to #711, by @antont).
 - `analyze` also counts `Number.parseInt` and `Number.parseFloat` calls as `Number semantics`,
   alongside global `parseInt` and `parseFloat` (#730 by @brixtonpham).
 - `--db-dump` output is recorded with `\n` line endings: on Windows, Python's `print` and `sqlite3`
